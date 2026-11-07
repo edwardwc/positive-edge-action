@@ -1,0 +1,2 @@
+{ "name": "positive-edge-analyzer", "private": true, "type": "module",
+  "dependencies": { "@cfworker/json-schema": "^4.1.1", "typescript": "^5.8.2" } }

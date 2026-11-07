@@ -1,0 +1,207 @@
+name: Positive Edge analyzer
+description: Generate and review a positive-edge request contract for any web application.
+inputs:
+  working-directory:
+    description: Application path relative to the caller repository, or an absolute path
+    required: false
+    default: .
+  provider:
+    description: Analyzer provider (anthropic or mock)
+    required: false
+    default: anthropic
+  model:
+    description: Anthropic model override
+    required: false
+    default: ""
+  anthropic-api-key:
+    description: Anthropic API key
+    required: false
+    default: ""
+  output:
+    description: Contract output path relative to working-directory, or an absolute path
+    required: false
+    default: edge-contract.json
+  create-pr:
+    description: Create a pull request with the generated contract
+    required: false
+    default: "true"
+  deploy-worker:
+    description: Deploy the Worker after generating the contract
+    required: false
+    default: "false"
+  cloudflare-api-token:
+    description: Cloudflare API token
+    required: false
+    default: ""
+  cloudflare-account-id:
+    description: Cloudflare account ID
+    required: false
+    default: ""
+  origin-url:
+    description: Origin URL used by the Worker
+    required: false
+    default: ""
+  worker-name:
+    description: Cloudflare Worker name
+    required: false
+    default: positive-edge
+  dashboard-url:
+    description: Positive Edge dashboard URL. When set with dashboard-token, the generated contract is uploaded and validated there.
+    required: false
+    default: ""
+  dashboard-token:
+    description: "Optional app ingest key. Leave empty to authenticate with GitHub OIDC (needs permissions id-token: write)."
+    required: false
+    default: ""
+  mode:
+    description: Worker mode (report or enforce)
+    required: false
+    default: report
+runs:
+  using: composite
+  steps:
+    - name: Set up Node.js 22
+      uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      with:
+        node-version: 22
+    - name: Install analyzer runtime
+      shell: bash
+      working-directory: ${{ github.action_path }}/pe
+      run: npm install --omit=dev --no-audit --no-fund --silent
+    - name: Resolve application paths
+      id: paths
+      shell: bash
+      env:
+        GITHUB_WORKSPACE: ${{ github.workspace }}
+        INPUT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        INPUT_OUTPUT: ${{ inputs.output }}
+      run: |
+        if [[ "$INPUT_WORKING_DIRECTORY" == *$'\n'* || "$INPUT_WORKING_DIRECTORY" == *$'\r'* || "$INPUT_OUTPUT" == *$'\n'* || "$INPUT_OUTPUT" == *$'\r'* ]]; then
+          echo "::error::working-directory and output must not contain newline characters"
+          exit 1
+        fi
+        if [[ "$INPUT_WORKING_DIRECTORY" = /* ]]; then
+          app_dir="$INPUT_WORKING_DIRECTORY"
+        else
+          app_dir="$GITHUB_WORKSPACE/$INPUT_WORKING_DIRECTORY"
+        fi
+        if ! app_dir="$(cd "$app_dir" && pwd -P)"; then
+          echo "::error::Application directory does not exist: $INPUT_WORKING_DIRECTORY"
+          exit 1
+        fi
+        if [[ "$INPUT_OUTPUT" = /* ]]; then
+          contract_path="$INPUT_OUTPUT"
+        else
+          contract_path="$app_dir/$INPUT_OUTPUT"
+        fi
+        if [[ "$contract_path" =~ \.[jJ][sS][oO][nN]$ ]]; then
+          report_path="${contract_path%.*}.report.md"
+        else
+          report_path="$contract_path"
+        fi
+        cache_path="$app_dir/.positive-edge/cache.json"
+        {
+          printf 'app_dir=%s\n' "$app_dir"
+          printf 'contract_path=%s\n' "$contract_path"
+          printf 'report_path=%s\n' "$report_path"
+          printf 'cache_path=%s\n' "$cache_path"
+        } >> "$GITHUB_OUTPUT"
+    - name: Analyze routes
+      shell: bash
+      working-directory: ${{ steps.paths.outputs.app_dir }}
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        DASHBOARD_URL: ${{ inputs.dashboard-url }}
+        ACTION_DIR: ${{ github.action_path }}
+        APP_DIR: ${{ steps.paths.outputs.app_dir }}
+        CONTRACT_PATH: ${{ steps.paths.outputs.contract_path }}
+        PROVIDER: ${{ inputs.provider }}
+        MODEL: ${{ inputs.model }}
+      run: |
+        if [[ -z "$ANTHROPIC_API_KEY" && -n "$DASHBOARD_URL" ]]; then
+          export ANTHROPIC_BASE_URL="${DASHBOARD_URL%/}/api/v1/anthropic"
+          export POSITIVE_EDGE_OIDC_AUDIENCE="${DASHBOARD_URL%/}"
+        fi
+        args=(analyze --dir "$APP_DIR" --out "$CONTRACT_PATH" --provider "$PROVIDER")
+        if [[ -n "$MODEL" ]]; then args+=(--model "$MODEL"); fi
+        node "$ACTION_DIR/pe/dist/cli.mjs" "${args[@]}"
+    - name: Upload contract and report
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: positive-edge-contract
+        path: |
+          ${{ steps.paths.outputs.contract_path }}
+          ${{ steps.paths.outputs.report_path }}
+          ${{ steps.paths.outputs.cache_path }}
+        include-hidden-files: true
+        if-no-files-found: error
+    - name: Upload contract to dashboard
+      if: inputs.dashboard-url != ''
+      shell: bash
+      env:
+        DASHBOARD_URL: ${{ inputs.dashboard-url }}
+        DASHBOARD_TOKEN: ${{ inputs.dashboard-token }}
+        CONTRACT_PATH: ${{ steps.paths.outputs.contract_path }}
+      run: |
+        if [[ -z "$DASHBOARD_TOKEN" ]]; then
+          if [[ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]]; then
+            echo "::error::Add 'permissions: id-token: write' to the workflow (or set dashboard-token)"
+            exit 1
+          fi
+          DASHBOARD_TOKEN=$(curl -sS -H "authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=${DASHBOARD_URL%/}" | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).value))')
+          echo "::add-mask::$DASHBOARD_TOKEN"
+        fi
+        status=$(curl -sS -o "$RUNNER_TEMP/pe-upload.json" -w '%{http_code}' \
+          -X POST "${DASHBOARD_URL%/}/api/v1/contracts" \
+          -H "authorization: Bearer $DASHBOARD_TOKEN" \
+          -H "content-type: application/json" \
+          -H "x-commit-sha: $GITHUB_SHA" \
+          -H "x-repository: $GITHUB_REPOSITORY" \
+          -H "x-ref: $GITHUB_REF" \
+          --data-binary "@$CONTRACT_PATH")
+        cat "$RUNNER_TEMP/pe-upload.json"; echo
+        if [[ "$status" != "201" ]]; then
+          echo "::error::Positive Edge dashboard rejected the contract (HTTP $status)"
+          exit 1
+        fi
+    - name: Stage analyzer cache for pull request
+      if: inputs.create-pr == 'true'
+      shell: bash
+      env:
+        APP_DIR: ${{ steps.paths.outputs.app_dir }}
+      run: |
+        if [[ ! -f "$APP_DIR/.positive-edge/cache.json" ]]; then
+          echo "::error::Analyzer cache was not created at $APP_DIR/.positive-edge/cache.json"
+          exit 1
+        fi
+        git -C "$APP_DIR" add -f -- .positive-edge/cache.json
+    - name: Create contract pull request
+      if: inputs.create-pr == 'true'
+      uses: peter-evans/create-pull-request@271a8d0340265f705b14b6d32b9829c1cb33d45e # v7.0.8
+      with:
+        path: ${{ steps.paths.outputs.app_dir }}
+        branch: positive-edge/contract
+        title: Update positive-edge contract
+        commit-message: Update positive-edge contract
+        body-file: ${{ steps.paths.outputs.report_path }}
+    - name: Deploy Worker
+      if: inputs.deploy-worker == 'true'
+      shell: bash
+      working-directory: ${{ github.action_path }}/pe/worker
+      env:
+        CLOUDFLARE_API_TOKEN: ${{ inputs.cloudflare-api-token }}
+        CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare-account-id }}
+        ACTION_DIR: ${{ github.action_path }}
+        CONTRACT_PATH: ${{ steps.paths.outputs.contract_path }}
+        ORIGIN_URL: ${{ inputs.origin-url }}
+        WORKER_NAME: ${{ inputs.worker-name }}
+        MODE: ${{ inputs.mode }}
+      run: |
+        if [[ -z "$ORIGIN_URL" ]]; then
+          echo "::error::origin-url is required when deploy-worker is true"
+          exit 1
+        fi
+        cp "$CONTRACT_PATH" contract.json
+        sed "s#__PE_CONTRACT_PATH__#./contract.json#" worker.template.js > worker.js
+        printf 'main = "worker.js"\ncompatibility_date = "2025-03-01"\n' > wrangler.toml
+        npx wrangler deploy --name "$WORKER_NAME" --var "ORIGIN_URL:$ORIGIN_URL" --var "MODE:$MODE"
